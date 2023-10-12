@@ -99,6 +99,7 @@ bool l_ecc_scalars_are_equal(const struct l_ecc_scalar *a,
 
 bool l_ecc_points_are_equal(const struct l_ecc_point *a,
 				const struct l_ecc_point *b);
+bool l_ecc_point_is_infinity(const struct l_ecc_point *p);
 
 #ifdef __cplusplus
 }

@@ -598,6 +598,7 @@ global:
 	l_ecc_point_clone;
 	l_ecc_point_get_curve;
 	l_ecc_points_are_equal;
+	l_ecc_point_is_infinity;
 	l_ecc_scalar_add;
 	l_ecc_scalar_free;
 	l_ecc_scalar_get_data;

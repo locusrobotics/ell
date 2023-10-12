@@ -1011,3 +1011,8 @@ LIB_EXPORT bool l_ecc_points_are_equal(const struct l_ecc_point *a,
 	return ((memcmp(a->x, b->x, a->curve->ndigits * 8) == 0) &&
 			(memcmp(a->y, b->y, a->curve->ndigits * 8) == 0));
 }
+
+LIB_EXPORT bool l_ecc_point_is_infinity(const struct l_ecc_point *p)
+{
+	return _ecc_point_is_zero(p);
+}
