@@ -18,7 +18,9 @@
 #include "private.h"
 #include "useful.h"
 #include "key.h"
+#include "key-private.h"
 #include "queue.h"
+#include "ecc.h"
 #include "asn1-private.h"
 #include "cipher.h"
 #include "pem-private.h"
@@ -858,9 +860,138 @@ LIB_EXPORT bool l_certchain_verify(struct l_certchain *chain,
 	return true;
 }
 
+/*
+ * Named-curve OIDs used in PKCS#8 EC PrivateKeyInfo AlgorithmIdentifier
+ * parameters and their corresponding ELL curve names.
+ */
+static const struct {
+	struct asn1_oid oid;
+	const char *name;
+} ec_named_curves[] = {
+	{ /* secp256r1 / prime256v1  1.2.840.10045.3.1.7 */
+		{ 8, { 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 } },
+		"secp256r1"
+	},
+	{ /* secp384r1  1.3.132.0.34 */
+		{ 5, { 0x2b, 0x81, 0x04, 0x00, 0x22 } },
+		"secp384r1"
+	},
+	{ /* secp521r1  1.3.132.0.35 */
+		{ 5, { 0x2b, 0x81, 0x04, 0x00, 0x23 } },
+		"secp521r1"
+	},
+};
+
+/*
+ * Try to parse an EC private key from a PKCS#8 PrivateKeyInfo.
+ *
+ * PrivateKeyInfo ::= SEQUENCE {
+ *   version           INTEGER,
+ *   algorithmIdentifier SEQUENCE {
+ *     algorithm OID,           <- id-ecPublicKey (1.2.840.10045.2.1)
+ *     parameters OID           <- namedCurve OID
+ *   },
+ *   privateKey        OCTET STRING  <- ECPrivateKey
+ * }
+ *
+ * ECPrivateKey ::= SEQUENCE {
+ *   version    INTEGER,
+ *   privateKey OCTET STRING,  <- the raw scalar
+ *   ...
+ * }
+ *
+ * Returns a software l_key or NULL if not an EC key or parsing fails.
+ */
+static struct l_key *pkcs8_parse_ec_privkey(const uint8_t *der, size_t der_len)
+{
+	const uint8_t *seq, *alg_seq, *alg_oid, *param_oid, *priv_oct;
+	const uint8_t *ec_seq, *ec_privkey;
+	uint8_t tag;
+	size_t seq_len, alg_seq_len, alg_oid_len, param_oid_len;
+	size_t priv_oct_len, ec_seq_len, ec_privkey_len;
+	const struct l_ecc_curve *curve = NULL;
+	struct l_ecc_scalar *scalar = NULL;
+	struct l_key *key = NULL;
+	unsigned int i;
+
+	/* Outer SEQUENCE */
+	seq = asn1_der_find_elem(der, der_len, 0, &tag, &seq_len);
+	if (!seq || tag != ASN1_ID_SEQUENCE)
+		return NULL;
+
+	/* Skip version INTEGER (index 0) */
+	/* AlgorithmIdentifier SEQUENCE (index 1) */
+	alg_seq = asn1_der_find_elem(seq, seq_len, 1, &tag, &alg_seq_len);
+	if (!alg_seq || tag != ASN1_ID_SEQUENCE)
+		return NULL;
+
+	/* Algorithm OID (index 0 of AlgorithmIdentifier) */
+	alg_oid = asn1_der_find_elem(alg_seq, alg_seq_len, 0, &tag,
+					&alg_oid_len);
+	if (!alg_oid || tag != ASN1_ID_OID)
+		return NULL;
+
+	/* Check for id-ecPublicKey: 1.2.840.10045.2.1 */
+	if (alg_oid_len != pkcs1_encryption_oids[1].oid.asn1_len ||
+			memcmp(alg_oid, pkcs1_encryption_oids[1].oid.asn1,
+				alg_oid_len))
+		return NULL;
+
+	/* Named curve OID (index 1 of AlgorithmIdentifier) */
+	param_oid = asn1_der_find_elem(alg_seq, alg_seq_len, 1, &tag,
+					&param_oid_len);
+	if (!param_oid || tag != ASN1_ID_OID)
+		return NULL;
+
+	for (i = 0; i < L_ARRAY_SIZE(ec_named_curves); i++) {
+		if (param_oid_len == ec_named_curves[i].oid.asn1_len &&
+				!memcmp(param_oid, ec_named_curves[i].oid.asn1,
+					param_oid_len)) {
+			curve = l_ecc_curve_from_name(ec_named_curves[i].name);
+			break;
+		}
+	}
+
+	if (!curve)
+		return NULL;
+
+	/* privateKey OCTET STRING (index 2 of PrivateKeyInfo) */
+	priv_oct = asn1_der_find_elem(seq, seq_len, 2, &tag, &priv_oct_len);
+	if (!priv_oct || tag != ASN1_ID_OCTET_STRING)
+		return NULL;
+
+	/* Inner ECPrivateKey SEQUENCE */
+	ec_seq = asn1_der_find_elem(priv_oct, priv_oct_len, 0, &tag,
+					&ec_seq_len);
+	if (!ec_seq || tag != ASN1_ID_SEQUENCE)
+		return NULL;
+
+	/* Skip version INTEGER (index 0); scalar is OCTET STRING (index 1) */
+	ec_privkey = asn1_der_find_elem(ec_seq, ec_seq_len, 1, &tag,
+					&ec_privkey_len);
+	if (!ec_privkey || tag != ASN1_ID_OCTET_STRING)
+		return NULL;
+
+	/* Build the scalar: l_ecc_scalar_new validates range [2, n-1] */
+	scalar = l_ecc_scalar_new(curve, ec_privkey, ec_privkey_len);
+	if (!scalar)
+		return NULL;
+
+	key = key_new_ec_private(scalar);
+	l_ecc_scalar_free(scalar);
+
+	return key;
+}
+
 struct l_key *cert_key_from_pkcs8_private_key_info(const uint8_t *der,
 							size_t der_len)
 {
+	struct l_key *ec_key = pkcs8_parse_ec_privkey(der, der_len);
+
+	if (ec_key)
+		return ec_key;
+
+	/* Fall back to RSA (kernel handles RSA PKCS#8 natively) */
 	return l_key_new(L_KEY_RSA, der, der_len);
 }
 
