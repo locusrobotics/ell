@@ -19,9 +19,12 @@
 #include "private.h"
 #include "useful.h"
 #include "key.h"
+#include "key-private.h"
 #include "string.h"
 #include "random.h"
 #include "missing.h"
+#include "ecc.h"
+#include "ecc-private.h"
 
 #ifndef KEYCTL_DH_COMPUTE
 #define KEYCTL_DH_COMPUTE 23
@@ -84,6 +87,8 @@ static int32_t internal_keyring;
 struct l_key {
 	int type;
 	int32_t serial;
+	/* Non-NULL for software EC private keys (serial unused). */
+	struct l_ecc_scalar *ec_privkey;
 };
 
 struct l_keyring {
@@ -326,9 +331,163 @@ LIB_EXPORT void l_key_free_norevoke(struct l_key *key)
 	if (unlikely(!key))
 		return;
 
+	if (key->ec_privkey) {
+		l_ecc_scalar_free(key->ec_privkey);
+		l_free(key);
+		return;
+	}
+
 	kernel_unlink_key(key->serial, internal_keyring);
 
 	l_free(key);
+}
+
+/*
+ * Create a software EC private key that does not use the kernel keyring.
+ * The scalar must be a valid private key in [1, n-1] for the given curve.
+ */
+struct l_key *key_new_ec_private(const struct l_ecc_scalar *scalar)
+{
+	struct l_key *key;
+
+	if (unlikely(!scalar))
+		return NULL;
+
+	key = l_new(struct l_key, 1);
+	key->type = L_KEY_ECC;
+	key->ec_privkey = l_ecc_scalar_clone(scalar);
+
+	if (!key->ec_privkey) {
+		l_free(key);
+		return NULL;
+	}
+
+	return key;
+}
+
+/* Maximum DER signature size for any supported curve: 2 + 2*(2 + 1 + 66) */
+#define EC_DER_SIG_MAX (2 + 2 * (2 + 1 + L_ECC_MAX_DIGITS * 8))
+
+/*
+ * Software ECDSA signing per FIPS 186-4 Section 6.3.
+ * Produces a DER-encoded Ecdsa-Sig-Value: SEQUENCE { INTEGER r, INTEGER s }.
+ */
+static ssize_t key_ec_sign(struct l_key *key,
+				const uint8_t *hash, size_t hash_len,
+				uint8_t *out, size_t out_len)
+{
+	const struct l_ecc_curve *curve = key->ec_privkey->curve;
+	unsigned int ndigits = curve->ndigits;
+	unsigned int nbytes  = ndigits * 8;
+	struct l_ecc_point R;
+	uint64_t k_vli[L_ECC_MAX_DIGITS];
+	uint64_t r_vli[L_ECC_MAX_DIGITS];
+	uint64_t s_vli[L_ECC_MAX_DIGITS];
+	uint64_t z_vli[L_ECC_MAX_DIGITS];
+	uint64_t tmp[L_ECC_MAX_DIGITS];
+	uint64_t rd[L_ECC_MAX_DIGITS];
+	uint64_t z_plus_rd[L_ECC_MAX_DIGITS];
+	uint8_t z_buf[L_ECC_MAX_DIGITS * 8];
+	uint8_t r_raw[L_ECC_MAX_DIGITS * 8];
+	uint8_t s_raw[L_ECC_MAX_DIGITS * 8];
+	uint8_t r_enc[L_ECC_MAX_DIGITS * 8 + 1];
+	uint8_t s_enc[L_ECC_MAX_DIGITS * 8 + 1];
+	unsigned int r_len, s_len, seq_len;
+	unsigned int i;
+	uint8_t *ptr;
+
+	R.curve = curve;
+
+	/* z = hash truncated/padded to nbytes, big-endian → native VLI */
+	memset(z_buf, 0, nbytes);
+	if (hash_len >= nbytes)
+		memcpy(z_buf, hash, nbytes);
+	else
+		memcpy(z_buf + nbytes - hash_len, hash, hash_len);
+	_ecc_be2native(z_vli, (const uint64_t *)z_buf, ndigits);
+	/* Reduce z mod n (p and n are close so at most one subtraction needed) */
+	if (_vli_cmp(z_vli, curve->n, ndigits) >= 0)
+		_vli_sub(z_vli, z_vli, curve->n, ndigits);
+
+	for (i = 0; i < 10; i++) {
+		_auto_(l_ecc_scalar_free) struct l_ecc_scalar *k_scalar =
+			l_ecc_scalar_new_random(curve);
+		if (!k_scalar)
+			return -ENOMEM;
+		memcpy(k_vli, k_scalar->c, nbytes);
+
+		/* R = k * G */
+		_ecc_point_mult(&R, &curve->g, k_vli, NULL, curve->p);
+		if (_ecc_point_is_zero(&R))
+			continue;
+
+		/* r = R.x mod n (R.x is mod p; for NIST curves p and n are
+		 * close so a single conditional subtraction suffices) */
+		memcpy(r_vli, R.x, nbytes);
+		if (_vli_cmp(r_vli, curve->n, ndigits) >= 0)
+			_vli_sub(r_vli, r_vli, curve->n, ndigits);
+		if (_vli_is_zero_or_one(r_vli, ndigits))
+			continue;
+
+		/* k_inv = k^(-1) mod n */
+		_vli_mod_inv(tmp, k_vli, curve->n, ndigits);
+
+		/* rd = r * d mod n */
+		_vli_mod_mult_slow(rd, r_vli, key->ec_privkey->c,
+					curve->n, ndigits);
+		/* z_plus_rd = (z + rd) mod n */
+		_vli_mod_add(z_plus_rd, z_vli, rd, curve->n, ndigits);
+		/* s = k_inv * (z + rd) mod n */
+		_vli_mod_mult_slow(s_vli, tmp, z_plus_rd, curve->n, ndigits);
+
+		if (_vli_is_zero_or_one(s_vli, ndigits))
+			continue;
+
+		break;
+	}
+
+	if (i >= 10)
+		return -EAGAIN;
+
+	/* Convert r and s to big-endian */
+	_ecc_native2be((uint64_t *)r_raw, r_vli, ndigits);
+	_ecc_native2be((uint64_t *)s_raw, s_vli, ndigits);
+
+	/* DER INTEGER: strip leading zeros; prepend 0x00 if high bit set */
+	#define DER_INTEGER_ENCODE(raw, enc, len) do { \
+		unsigned int skip = 0; \
+		while (skip < nbytes - 1 && !(raw)[skip] && \
+				!((raw)[skip + 1] & 0x80)) \
+			skip++; \
+		if ((raw)[skip] & 0x80) { \
+			(enc)[0] = 0x00; \
+			memcpy((enc) + 1, (raw) + skip, nbytes - skip); \
+			(len) = nbytes - skip + 1; \
+		} else { \
+			memcpy((enc), (raw) + skip, nbytes - skip); \
+			(len) = nbytes - skip; \
+		} \
+	} while (0)
+
+	DER_INTEGER_ENCODE(r_raw, r_enc, r_len);
+	DER_INTEGER_ENCODE(s_raw, s_enc, s_len);
+	#undef DER_INTEGER_ENCODE
+
+	seq_len = 2 + r_len + 2 + s_len;
+	if (out_len < (size_t)(2 + seq_len))
+		return -EMSGSIZE;
+
+	ptr = out;
+	*ptr++ = 0x30;        /* SEQUENCE */
+	*ptr++ = seq_len;
+	*ptr++ = 0x02;        /* INTEGER r */
+	*ptr++ = r_len;
+	memcpy(ptr, r_enc, r_len); ptr += r_len;
+	*ptr++ = 0x02;        /* INTEGER s */
+	*ptr++ = s_len;
+	memcpy(ptr, s_enc, s_len); ptr += s_len;
+
+	return ptr - out;
 }
 
 LIB_EXPORT bool l_key_update(struct l_key *key, const void *payload, size_t len)
@@ -431,6 +590,19 @@ LIB_EXPORT bool l_key_get_info(struct l_key *key, enum l_key_cipher_type cipher,
 {
 	if (unlikely(!key))
 		return false;
+
+	if (key->ec_privkey) {
+		if (cipher != L_KEY_ECDSA_X962)
+			return false;
+		/* Report the max DER signature size in bits; always private */
+		if (bits) {
+			unsigned int nbytes = key->ec_privkey->curve->ndigits * 8;
+			*bits = (2 + 2 * (2 + nbytes + 1)) * 8;
+		}
+		if (public)
+			*public = false;
+		return true;
+	}
 
 	return !kernel_query_key(key->serial, lookup_cipher(cipher),
 					lookup_checksum(checksum), bits,
@@ -622,13 +794,18 @@ LIB_EXPORT ssize_t l_key_sign(struct l_key *key,
 				enum l_checksum_type checksum, const void *in,
 				void *out, size_t len_in, size_t len_out)
 {
-	ssize_t ret_len;
+	if (unlikely(!key))
+		return -EINVAL;
 
-	ret_len = eds_common(key, cipher, checksum, in, out,
+	if (key->ec_privkey) {
+		if (cipher != L_KEY_ECDSA_X962)
+			return -EINVAL;
+		return key_ec_sign(key, in, len_in, out, len_out);
+	}
+
+	return eds_common(key, cipher, checksum, in, out,
 				len_in, len_out,
 				KEYCTL_PKEY_SIGN);
-
-	return ret_len;
 }
 
 LIB_EXPORT bool l_key_verify(struct l_key *key,
