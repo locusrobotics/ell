@@ -423,6 +423,22 @@ static const struct tls_conn_test tls_conn_test_full_auth = {
 		"/CN=Foo Example Organization/emailAddress=foo@mail.example",
 };
 
+/*
+ * TLS mutual authentication using ECDSA P-256 client and server certificates.
+ * Both sides use ECDSA, so the negotiated cipher suite will be ECDHE_ECDSA.
+ * P-256 with SHA-256 is used to match the default PRF hash selection.
+ */
+static const struct tls_conn_test tls_conn_test_ecdsa_client_auth = {
+	.server_cert_path = CERTDIR "ec256-server.pem",
+	.server_key_path = CERTDIR "ec256-server-key.pem",
+	.server_ca_cert_path = CERTDIR "ec256-ca.pem",
+	.server_expect_identity = "/CN=ec256-client",
+	.client_cert_path = CERTDIR "ec256-client.pem",
+	.client_key_path = CERTDIR "ec256-client-key.pem",
+	.client_ca_cert_path = CERTDIR "ec256-ca.pem",
+	.client_expect_identity = "/CN=ec256-server",
+};
+
 static const struct tls_conn_test tls_conn_test_bad_client_suite = {
 	.server_cert_path = CERTDIR "cert-server.pem",
 	.server_key_path = CERTDIR "cert-server-key-pkcs8.pem",
@@ -698,6 +714,16 @@ static void test_tls_test(const void *data)
 	test_tls_with_ver(test, 0, 0);
 	test_tls_with_ver(test, 0, L_TLS_V11);
 	test_tls_with_ver(test, L_TLS_V10, 0);
+}
+
+/*
+ * Run a TLS connection test with TLS 1.2 only.  Used for ECDSA client
+ * certificate authentication because the ECDSA GCM cipher suites require
+ * TLS 1.2 and P-384 requires SHA-384 which is only in those suites.
+ */
+static void test_tls_test_v12_only(const void *data)
+{
+	test_tls_with_ver(data, L_TLS_V12, L_TLS_V12);
 }
 
 static void test_max_keys(const void *data)
@@ -1008,6 +1034,9 @@ int main(int argc, char *argv[])
 			L_TEST_FLAG_ALLOW_FAILURE);
 	l_test_add_data_func("TLS connection full auth",
 			&tls_conn_test_full_auth, test_tls_test,
+			L_TEST_FLAG_ALLOW_FAILURE);
+	l_test_add_data_func("TLS ECDSA client auth",
+			&tls_conn_test_ecdsa_client_auth, test_tls_test_v12_only,
 			L_TEST_FLAG_ALLOW_FAILURE);
 
 	l_test_add_data_func("TLS connection bad client cipher suite",

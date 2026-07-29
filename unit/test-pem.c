@@ -406,6 +406,57 @@ static void test_load_file(const void *data)
 		certchain, privkey, encrypted),				\
 		test_load_file, pkcs8_key_parser_precheck, 0)
 
+static void test_ec_privkey_sign(const void *data)
+{
+	bool encrypted;
+	const uint8_t msg[] = "hello ECDSA";
+	uint8_t sig[128];
+	ssize_t sig_len;
+	struct l_key *key;
+	struct l_certchain *chain;
+	struct l_cert *cert;
+	struct l_key *pubkey;
+	bool verified;
+	size_t bits;
+	bool is_public;
+
+	/* Load P-256 EC PKCS#8 private key */
+	key = l_pem_load_private_key(CERTDIR "ec256-client-key.pem",
+					NULL, &encrypted);
+	assert(key);
+	assert(!encrypted);
+
+	/* Must be recognised as an EC private key via ECDSA_X962 */
+	assert(l_key_get_info(key, L_KEY_ECDSA_X962,
+				L_CHECKSUM_NONE, &bits, &is_public));
+	assert(!is_public);
+	assert(bits > 0);
+
+	/* Sign a message hash */
+	sig_len = l_key_sign(key, L_KEY_ECDSA_X962, L_CHECKSUM_SHA256,
+				msg, sig, sizeof(msg), sizeof(sig));
+	assert(sig_len > 0);
+
+	/* Verify the signature with the matching public key from the cert */
+	chain = l_pem_load_certificate_chain(CERTDIR "ec256-client.pem");
+	assert(chain);
+
+	cert = l_certchain_get_leaf(chain);
+	assert(cert);
+	assert(l_cert_get_pubkey_type(cert) == L_CERT_KEY_ECC);
+
+	pubkey = l_cert_get_pubkey(cert);
+	assert(pubkey);
+
+	verified = l_key_verify(pubkey, L_KEY_ECDSA_X962, L_CHECKSUM_SHA256,
+				msg, sig, sizeof(msg), sig_len);
+	assert(verified);
+
+	l_key_free(pubkey);
+	l_certchain_free(chain);
+	l_key_free(key);
+}
+
 int main(int argc, char *argv[])
 {
 	l_test_init(&argc, &argv);
@@ -497,6 +548,10 @@ int main(int argc, char *argv[])
 			"cert-entity-pkcs12-rc4-sha384.p12", true, true, true, true);
 	add_file_test("pkcs#12/Combined PKCS#5 ciphers + SHA512",
 			"cert-entity-pkcs12-pkcs5-sha512.p12", true, true, true, true);
+
+	/* EC PKCS#8 private key loading and software ECDSA signing */
+	l_test_add("ec/PKCS#8 EC private key sign and verify",
+			test_ec_privkey_sign, NULL);
 
 done:
 	return l_test_run();
