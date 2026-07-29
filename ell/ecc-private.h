@@ -95,6 +95,9 @@ bool _vli_mmod_fast(uint64_t *result, const uint64_t *product,
 void _vli_mod_mult_fast(uint64_t *result, const uint64_t *left,
 		const uint64_t *right, const uint64_t *curve_prime,
 		unsigned int ndigits);
+void _vli_mod_mult_slow(uint64_t *result, const uint64_t *left,
+		const uint64_t *right, const uint64_t *mod,
+		unsigned int ndigits);
 void _vli_mod_square_fast(uint64_t *result, const uint64_t *left,
 					const uint64_t *curve_prime,
 					unsigned int ndigits);

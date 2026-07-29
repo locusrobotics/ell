@@ -734,6 +734,21 @@ void _vli_mod_mult_fast(uint64_t *result, const uint64_t *left,
 	_vli_mmod_fast(result, product, curve_prime, ndigits);
 }
 
+/*
+ * Computes result = (left * right) % mod using the generic slow reduction.
+ * Unlike _vli_mod_mult_fast this works for any prime, not just NIST primes.
+ * Used for arithmetic modulo the group order n.
+ */
+void _vli_mod_mult_slow(uint64_t *result, const uint64_t *left,
+			const uint64_t *right, const uint64_t *mod,
+			unsigned int ndigits)
+{
+	uint64_t product[2 * L_ECC_MAX_DIGITS];
+
+	vli_mult(product, left, right, ndigits);
+	_vli_mmod_slow(result, product, mod, ndigits);
+}
+
 /* Computes result = left^2 % curve_p. */
 void _vli_mod_square_fast(uint64_t *result, const uint64_t *left,
 					const uint64_t *curve_prime,
