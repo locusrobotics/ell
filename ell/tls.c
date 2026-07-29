@@ -3686,11 +3686,19 @@ LIB_EXPORT bool l_tls_set_auth_data(struct l_tls *tls,
 		if (!l_key_get_info(tls->priv_key, L_KEY_RSA_PKCS1_V1_5,
 					L_CHECKSUM_NONE, &tls->priv_key_size,
 					&is_public) || is_public) {
-			TLS_DEBUG("Not a private key or l_key_get_info failed");
-			tls->cert = NULL;
-			tls->priv_key = NULL;
-			tls->priv_key_size = 0;
-			return false;
+			/* Try EC private key */
+			is_public = true;
+			if (!l_key_get_info(tls->priv_key, L_KEY_ECDSA_X962,
+						L_CHECKSUM_NONE,
+						&tls->priv_key_size,
+						&is_public) || is_public) {
+				TLS_DEBUG("Not a private key or "
+						"l_key_get_info failed");
+				tls->cert = NULL;
+				tls->priv_key = NULL;
+				tls->priv_key_size = 0;
+				return false;
+			}
 		}
 
 		tls->priv_key_size /= 8;

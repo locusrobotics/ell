@@ -318,9 +318,66 @@ static bool tls_ecdsa_verify(struct l_tls *tls,
 	return success;
 }
 
+static ssize_t tls_ecdsa_sign(struct l_tls *tls, uint8_t *out, size_t out_len,
+				tls_get_hash_t get_hash,
+				const uint8_t *data, size_t data_len)
+{
+	const struct tls_hash_algorithm *hash_type;
+	uint8_t hash[HANDSHAKE_HASH_MAX_SIZE];
+	size_t hash_len;
+	uint8_t *ptr = out;
+	ssize_t sig_len;
+	/* Max DER sig: SEQUENCE + 2 * (tag + len + 0x00 + 66 bytes) = 2+2*69 */
+	uint8_t sig_buf[2 + 2 * (2 + 1 + 66)];
+
+	if (!tls->priv_key) {
+		TLS_DISCONNECT(TLS_ALERT_INTERNAL_ERROR, TLS_ALERT_BAD_CERT,
+				"No private key loaded");
+		return -ENOKEY;
+	}
+
+	if (tls->negotiated_version < L_TLS_V12) {
+		TLS_DISCONNECT(TLS_ALERT_INTERNAL_ERROR, 0,
+				"ECDSA signing requires TLS 1.2 or later");
+		return -EINVAL;
+	}
+
+	hash_type = &tls_handshake_hash_data[tls->signature_hash];
+
+	/* Write SignatureAndHashAlgorithm */
+	if (out_len < 4)
+		goto error;
+	*ptr++ = hash_type->tls_id;
+	*ptr++ = SIGNATURE_ALGORITHM_ECDSA;
+	out_len -= 2;
+
+	get_hash(tls, tls->signature_hash, data, data_len, hash, &hash_len);
+
+	sig_len = l_key_sign(tls->priv_key, L_KEY_ECDSA_X962,
+				hash_type->l_id, hash, sig_buf,
+				hash_len, sizeof(sig_buf));
+	if (sig_len < 0)
+		goto error;
+
+	if (out_len < (size_t)(2 + sig_len))
+		goto error;
+
+	l_put_be16(sig_len, ptr);
+	ptr += 2;
+	memcpy(ptr, sig_buf, sig_len);
+	ptr += sig_len;
+
+	return ptr - out;
+
+error:
+	TLS_DISCONNECT(TLS_ALERT_INTERNAL_ERROR, 0, "ECDSA signing failed");
+	return -EINVAL;
+}
+
 static struct tls_signature_algorithm tls_ecdsa_signature = {
 	.id = 3, /* SignatureAlgorithm.ecdsa */
 	.validate_cert_key_type = tls_ecdsa_validate_cert_key,
+	.sign = tls_ecdsa_sign,
 	.verify = tls_ecdsa_verify,
 };
 
