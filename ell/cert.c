@@ -476,6 +476,65 @@ LIB_EXPORT enum l_cert_key_type l_cert_get_pubkey_type(struct l_cert *cert)
 }
 
 /*
+ * Extract an EC public key from the certificate's SubjectPublicKeyInfo.
+ * Parses the named-curve OID and the uncompressed point (04 || x || y)
+ * from the BIT STRING and returns a software l_key backed by the point.
+ */
+static struct l_key *cert_get_ec_pubkey(struct l_cert *cert)
+{
+	const uint8_t *spk;
+	size_t spk_len;
+	const uint8_t *alg_oid;
+	size_t alg_oid_len;
+	const struct l_ecc_curve *curve;
+	struct l_ecc_point *point;
+	struct l_key *key;
+
+	/* Named curve OID from AlgorithmIdentifier parameters */
+	alg_oid = asn1_der_find_elem_by_path(cert->asn1, cert->asn1_len,
+					ASN1_ID_OID, &alg_oid_len,
+					X509_CERTIFICATE_POS,
+					X509_TBSCERTIFICATE_POS,
+					X509_TBSCERT_SUBJECT_KEY_POS,
+					X509_SUBJECT_KEY_ALGORITHM_POS,
+					X509_ALGORITHM_ID_PARAMS_POS,
+					-1);
+	if (!alg_oid)
+		return NULL;
+
+	curve = cert_get_ec_curve_from_params_oid(alg_oid, alg_oid_len);
+	if (!curve)
+		return NULL;
+
+	/* SubjectPublicKey BIT STRING: unused-bits byte, then 04 || x || y */
+	spk = asn1_der_find_elem_by_path(cert->asn1, cert->asn1_len,
+					ASN1_ID_BIT_STRING, &spk_len,
+					X509_CERTIFICATE_POS,
+					X509_TBSCERTIFICATE_POS,
+					X509_TBSCERT_SUBJECT_KEY_POS,
+					X509_SUBJECT_KEY_VALUE_POS,
+					-1);
+	if (!spk || spk_len < 2)
+		return NULL;
+
+	spk++;     /* skip unused-bits byte */
+	spk_len--;
+	if (*spk != 0x04)  /* only accept uncompressed points */
+		return NULL;
+	spk++;     /* skip uncompressed-point indicator */
+	spk_len--;
+
+	point = l_ecc_point_from_data(curve, L_ECC_POINT_TYPE_FULL,
+					spk, spk_len);
+	if (!point)
+		return NULL;
+
+	key = key_new_ec_public(point);
+	l_ecc_point_free(point);
+	return key;
+}
+
+/*
  * Note: Returns a new l_key object to be freed by the caller.
  */
 LIB_EXPORT struct l_key *l_cert_get_pubkey(struct l_cert *cert)
@@ -486,68 +545,8 @@ LIB_EXPORT struct l_key *l_cert_get_pubkey(struct l_cert *cert)
 	switch (cert->pubkey_type) {
 	case L_CERT_KEY_RSA:
 		return l_key_new(L_KEY_RSA, cert->asn1, cert->asn1_len);
-	case L_CERT_KEY_ECC: {
-		/*
-		 * Extract the uncompressed EC point (04 || x || y) from the
-		 * SubjectPublicKeyInfo BIT STRING and create a software key so
-		 * that verification does not depend on the kernel supporting
-		 * every elliptic curve via ecdsa_generic.
-		 */
-		const uint8_t *spk;
-		size_t spk_len;
-		const uint8_t *alg_oid;
-		size_t alg_oid_len;
-		const struct l_ecc_curve *curve = NULL;
-		struct l_ecc_point *point;
-		struct l_key *key;
-
-		/* Named curve OID from AlgorithmIdentifier parameters */
-		alg_oid = asn1_der_find_elem_by_path(cert->asn1, cert->asn1_len,
-					ASN1_ID_OID, &alg_oid_len,
-					X509_CERTIFICATE_POS,
-					X509_TBSCERTIFICATE_POS,
-					X509_TBSCERT_SUBJECT_KEY_POS,
-					X509_SUBJECT_KEY_ALGORITHM_POS,
-					X509_ALGORITHM_ID_PARAMS_POS,
-					-1);
-		if (!alg_oid)
-			break;
-
-		curve = cert_get_ec_curve_from_params_oid(alg_oid, alg_oid_len);
-
-		if (!curve)
-			break;
-
-		/* SubjectPublicKey BIT STRING: skip the unused-bits byte */
-		spk = asn1_der_find_elem_by_path(cert->asn1, cert->asn1_len,
-					ASN1_ID_BIT_STRING, &spk_len,
-					X509_CERTIFICATE_POS,
-					X509_TBSCERTIFICATE_POS,
-					X509_TBSCERT_SUBJECT_KEY_POS,
-					X509_SUBJECT_KEY_VALUE_POS,
-					-1);
-		if (!spk || spk_len < 2)
-			break;
-
-		/* BIT STRING: first byte = unused bits count (should be 0),
-		 * then 04 (uncompressed point indicator), then x || y */
-		spk++;     /* skip unused-bits byte */
-		spk_len--;
-		if (*spk != 0x04)  /* only accept uncompressed points */
-			break;
-		spk++;     /* skip 04 prefix */
-		spk_len--;
-
-		point = l_ecc_point_from_data(curve,
-					L_ECC_POINT_TYPE_FULL,
-					spk, spk_len);
-		if (!point)
-			break;
-
-		key = key_new_ec_public(point);
-		l_ecc_point_free(point);
-		return key;
-	}
+	case L_CERT_KEY_ECC:
+		return cert_get_ec_pubkey(cert);
 	case L_CERT_KEY_UNKNOWN:
 		break;
 	}
