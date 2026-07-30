@@ -19,6 +19,22 @@
 #include "ecc-private.h"
 #include "ecdsa-private.h"
 
+/* DER INTEGER encoding: strip leading zeros, add 0x00 if high bit set */
+#define DER_INTEGER_ENCODE(raw, enc, len) do {				\
+		unsigned int skip = 0;					\
+		while (skip < nbytes - 1 && !(raw)[skip] &&		\
+				!((raw)[skip + 1] & 0x80))		\
+			skip++;						\
+		if ((raw)[skip] & 0x80) {				\
+			(enc)[0] = 0x00;				\
+			memcpy((enc) + 1, (raw) + skip, nbytes - skip); \
+			(len) = nbytes - skip + 1;			\
+		} else {						\
+			memcpy((enc), (raw) + skip, nbytes - skip);	\
+			(len) = nbytes - skip;				\
+		}							\
+	} while (0)
+
 /*
  * ECDSA signing — FIPS 186-4 Section 6.3.
  *
@@ -103,25 +119,8 @@ ssize_t ecdsa_sign(const struct l_ecc_scalar *privkey,
 	_ecc_native2be((uint64_t *)r_raw, r_vli, ndigits);
 	_ecc_native2be((uint64_t *)s_raw, s_vli, ndigits);
 
-	/* DER INTEGER encoding: strip leading zeros, add 0x00 if high bit set */
-#define DER_INTEGER_ENCODE(raw, enc, len) do {				\
-		unsigned int skip = 0;					\
-		while (skip < nbytes - 1 && !(raw)[skip] &&		\
-				!((raw)[skip + 1] & 0x80))		\
-			skip++;						\
-		if ((raw)[skip] & 0x80) {				\
-			(enc)[0] = 0x00;				\
-			memcpy((enc) + 1, (raw) + skip, nbytes - skip); \
-			(len) = nbytes - skip + 1;			\
-		} else {						\
-			memcpy((enc), (raw) + skip, nbytes - skip);	\
-			(len) = nbytes - skip;				\
-		}							\
-	} while (0)
-
 	DER_INTEGER_ENCODE(r_raw, r_enc, r_len);
 	DER_INTEGER_ENCODE(s_raw, s_enc, s_len);
-#undef DER_INTEGER_ENCODE
 
 	seq_len = 2 + r_len + 2 + s_len;
 	if (out_len < (size_t)(2 + seq_len))
