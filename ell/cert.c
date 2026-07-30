@@ -480,7 +480,7 @@ LIB_EXPORT enum l_cert_key_type l_cert_get_pubkey_type(struct l_cert *cert)
  * Parses the named-curve OID and the uncompressed point (04 || x || y)
  * from the BIT STRING and returns a software l_key backed by the point.
  */
-static struct l_key *cert_get_ec_pubkey(struct l_cert *cert)
+static struct l_key *cert_get_ec_pubkey(const uint8_t *asn1, size_t asn1_len)
 {
 	const uint8_t *spk;
 	size_t spk_len;
@@ -491,7 +491,7 @@ static struct l_key *cert_get_ec_pubkey(struct l_cert *cert)
 	struct l_key *key;
 
 	/* Named curve OID from AlgorithmIdentifier parameters */
-	alg_oid = asn1_der_find_elem_by_path(cert->asn1, cert->asn1_len,
+	alg_oid = asn1_der_find_elem_by_path(asn1, asn1_len,
 					ASN1_ID_OID, &alg_oid_len,
 					X509_CERTIFICATE_POS,
 					X509_TBSCERTIFICATE_POS,
@@ -507,7 +507,7 @@ static struct l_key *cert_get_ec_pubkey(struct l_cert *cert)
 		return NULL;
 
 	/* SubjectPublicKey BIT STRING: unused-bits byte, then 04 || x || y */
-	spk = asn1_der_find_elem_by_path(cert->asn1, cert->asn1_len,
+	spk = asn1_der_find_elem_by_path(asn1, asn1_len,
 					ASN1_ID_BIT_STRING, &spk_len,
 					X509_CERTIFICATE_POS,
 					X509_TBSCERTIFICATE_POS,
@@ -546,7 +546,7 @@ LIB_EXPORT struct l_key *l_cert_get_pubkey(struct l_cert *cert)
 	case L_CERT_KEY_RSA:
 		return l_key_new(L_KEY_RSA, cert->asn1, cert->asn1_len);
 	case L_CERT_KEY_ECC:
-		return cert_get_ec_pubkey(cert);
+		return cert_get_ec_pubkey(cert->asn1, cert->asn1_len);
 	case L_CERT_KEY_UNKNOWN:
 		break;
 	}
