@@ -3748,6 +3748,12 @@ bool tls_set_cipher_suites(struct l_tls *tls, const char **suite_list)
 	return false;
 }
 
+LIB_EXPORT bool l_tls_set_cipher_suites(struct l_tls *tls,
+						const char **suite_list)
+{
+	return tls_set_cipher_suites(tls, suite_list);
+}
+
 LIB_EXPORT void l_tls_set_version_range(struct l_tls *tls,
 					enum l_tls_version min_version,
 					enum l_tls_version max_version)

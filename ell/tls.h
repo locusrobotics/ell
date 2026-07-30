@@ -130,6 +130,8 @@ enum l_checksum_type;
 bool l_tls_prf_get_bytes(struct l_tls *tls, bool use_master_secret,
 				const char *label, uint8_t *buf, size_t len);
 
+bool l_tls_set_cipher_suites(struct l_tls *tls, const char **suite_list);
+
 bool l_tls_set_debug(struct l_tls *tls, l_tls_debug_cb_t function,
 			void *user_data, l_tls_destroy_cb_t destroy);
 bool l_tls_set_cert_dump_path(struct l_tls *tls, const char *path);
