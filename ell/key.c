@@ -89,6 +89,8 @@ struct l_key {
 	int32_t serial;
 	/* Non-NULL for software EC private keys (serial unused). */
 	struct l_ecc_scalar *ec_privkey;
+	/* Non-NULL for software EC public keys (serial unused). */
+	struct l_ecc_point  *ec_pubkey;
 };
 
 struct l_keyring {
@@ -337,6 +339,12 @@ LIB_EXPORT void l_key_free_norevoke(struct l_key *key)
 		return;
 	}
 
+	if (key->ec_pubkey) {
+		l_ecc_point_free(key->ec_pubkey);
+		l_free(key);
+		return;
+	}
+
 	kernel_unlink_key(key->serial, internal_keyring);
 
 	l_free(key);
@@ -365,7 +373,134 @@ struct l_key *key_new_ec_private(const struct l_ecc_scalar *scalar)
 	return key;
 }
 
-/* Maximum DER signature size for any supported curve: 2 + 2*(2 + 1 + 66) */
+/*
+ * Create a software EC public key for ECDSA verification.
+ */
+struct l_key *key_new_ec_public(const struct l_ecc_point *point)
+{
+	struct l_key *key;
+
+	if (unlikely(!point))
+		return NULL;
+
+	key = l_new(struct l_key, 1);
+	key->type = L_KEY_ECC;
+	key->ec_pubkey = l_ecc_point_clone(point);
+
+	if (!key->ec_pubkey) {
+		l_free(key);
+		return NULL;
+	}
+
+	return key;
+}
+
+/*
+ * Software ECDSA verification.  sig is a DER Ecdsa-Sig-Value.
+ * data is the pre-hashed message digest (z).
+ */
+static bool key_ec_verify(struct l_key *key,
+				const uint8_t *sig, size_t sig_len,
+				const uint8_t *z_bytes, size_t z_len)
+{
+	const struct l_ecc_curve *curve = key->ec_pubkey->curve;
+	unsigned int ndigits = curve->ndigits;
+	unsigned int nbytes  = ndigits * 8;
+	uint64_t r[L_ECC_MAX_DIGITS], s[L_ECC_MAX_DIGITS];
+	uint64_t z[L_ECC_MAX_DIGITS] = {};
+	uint64_t w[L_ECC_MAX_DIGITS];
+	uint64_t u1[L_ECC_MAX_DIGITS], u2[L_ECC_MAX_DIGITS];
+	struct l_ecc_point X1, X2, X;
+	const uint8_t *ptr = sig;
+	size_t len = sig_len;
+	uint16_t seq_len, r_len, s_len;
+	uint8_t r_buf[L_ECC_MAX_DIGITS * 8];
+	uint8_t s_buf[L_ECC_MAX_DIGITS * 8];
+
+	/* Parse DER SEQUENCE { INTEGER r, INTEGER s } */
+	if (len < 2 || *ptr++ != 0x30)
+		return false;
+	seq_len = *ptr++;
+	len -= 2;
+	if (seq_len != len)
+		return false;
+
+	/* r */
+	if (len < 2 || *ptr++ != 0x02)
+		return false;
+	r_len = *ptr++;
+	len -= 2;
+	if (r_len > len || r_len == 0)
+		return false;
+	/* Strip leading 0x00 pad byte if present */
+	if (*ptr == 0x00 && r_len > 1) { ptr++; r_len--; len--; }
+	if (r_len > nbytes)
+		return false;
+	memset(r_buf, 0, nbytes);
+	memcpy(r_buf + nbytes - r_len, ptr, r_len);
+	ptr += r_len; len -= r_len;
+
+	/* s */
+	if (len < 2 || *ptr++ != 0x02)
+		return false;
+	s_len = *ptr++;
+	len -= 2;
+	if (s_len > len || s_len == 0)
+		return false;
+	if (*ptr == 0x00 && s_len > 1) { ptr++; s_len--; len--; }
+	if (s_len > nbytes)
+		return false;
+	memset(s_buf, 0, nbytes);
+	memcpy(s_buf + nbytes - s_len, ptr, s_len);
+
+	_ecc_be2native(r, (const uint64_t *)r_buf, ndigits);
+	_ecc_be2native(s, (const uint64_t *)s_buf, ndigits);
+
+	/* Both r and s must be in [1, n-1] */
+	if (_vli_is_zero_or_one(r, ndigits) ||
+			_vli_cmp(r, curve->n, ndigits) >= 0)
+		return false;
+	if (_vli_is_zero_or_one(s, ndigits) ||
+			_vli_cmp(s, curve->n, ndigits) >= 0)
+		return false;
+
+	/* z = message digest, truncated/padded to nbytes */
+	{
+		uint8_t z_buf2[L_ECC_MAX_DIGITS * 8] = {};
+		unsigned int copy = (z_len < nbytes) ? z_len : nbytes;
+		memcpy(z_buf2 + nbytes - copy, z_bytes + z_len - copy, copy);
+		_ecc_be2native(z, (const uint64_t *)z_buf2, ndigits);
+		if (_vli_cmp(z, curve->n, ndigits) >= 0)
+			_vli_sub(z, z, curve->n, ndigits);
+	}
+
+	/* w = s^(-1) mod n */
+	_vli_mod_inv(w, s, curve->n, ndigits);
+
+	/* u1 = z * w mod n,  u2 = r * w mod n */
+	_vli_mod_mult_slow(u1, z, w, curve->n, ndigits);
+	_vli_mod_mult_slow(u2, r, w, curve->n, ndigits);
+
+	/* X = u1*G + u2*Q */
+	X1.curve = curve;
+	X2.curve = curve;
+	X.curve  = curve;
+	_ecc_point_mult(&X1, &curve->g,            u1, NULL, curve->p);
+	_ecc_point_mult(&X2, key->ec_pubkey,        u2, NULL, curve->p);
+	_ecc_point_add(&X, &X1, &X2, curve->p);
+
+	if (_ecc_point_is_zero(&X))
+		return false;
+
+	/* Check X.x mod n == r */
+	{
+		uint64_t x_mod_n[L_ECC_MAX_DIGITS];
+		memcpy(x_mod_n, X.x, nbytes);
+		if (_vli_cmp(x_mod_n, curve->n, ndigits) >= 0)
+			_vli_sub(x_mod_n, x_mod_n, curve->n, ndigits);
+		return _vli_cmp(x_mod_n, r, ndigits) == 0;
+	}
+}
 #define EC_DER_SIG_MAX (2 + 2 * (2 + 1 + L_ECC_MAX_DIGITS * 8))
 
 /*
@@ -604,6 +739,24 @@ LIB_EXPORT bool l_key_get_info(struct l_key *key, enum l_key_cipher_type cipher,
 		return true;
 	}
 
+	if (key->ec_pubkey) {
+		if (cipher != L_KEY_ECDSA_X962)
+			return false;
+		if (bits) {
+			/*
+			 * Report the curve coordinate size in bits.  This is
+			 * used by callers (e.g. tls_ecdsa_verify) to identify
+			 * the curve (32 = P-256, 48 = P-384) so that they can
+			 * enforce hash-curve compatibility.
+			 */
+			unsigned int nbytes = key->ec_pubkey->curve->ndigits * 8;
+			*bits = nbytes * 8;
+		}
+		if (public)
+			*public = true;
+		return true;
+	}
+
 	return !kernel_query_key(key->serial, lookup_cipher(cipher),
 					lookup_checksum(checksum), bits,
 					public);
@@ -814,17 +967,36 @@ LIB_EXPORT bool l_key_verify(struct l_key *key,
 				const void *sig, size_t len_data,
 				size_t len_sig)
 {
-	long result;
-
 	if (unlikely(!key))
 		return false;
 
-	result = kernel_key_verify(key->serial, lookup_cipher(cipher),
-					lookup_checksum(checksum),
-					data, len_data,
-					sig, len_sig);
+	/*
+	 * Software EC public key: compute the message digest ourselves then
+	 * run the software ECDSA verification so we don't depend on the
+	 * kernel's ecdsa_generic module supporting every curve.
+	 */
+	if (key->ec_pubkey) {
+		/*
+		 * For ECDSA, the convention (matching the kernel's
+		 * KEYCTL_PKEY_VERIFY behaviour) is that the caller passes the
+		 * pre-computed message digest as 'data'.  The 'checksum'
+		 * parameter names which hash was used but we don't re-hash
+		 * here — we use 'data' directly as the message digest z.
+		 */
+		if (cipher != L_KEY_ECDSA_X962)
+			return false;
 
-	return result >= 0;
+		return key_ec_verify(key, sig, len_sig, data, len_data);
+	}
+
+	{
+		long result = kernel_key_verify(key->serial,
+						lookup_cipher(cipher),
+						lookup_checksum(checksum),
+						data, len_data,
+						sig, len_sig);
+		return result >= 0;
+	}
 }
 
 LIB_EXPORT struct l_keyring *l_keyring_new(void)

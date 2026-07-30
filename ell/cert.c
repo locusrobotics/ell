@@ -83,6 +83,45 @@ static const struct pkcs1_encryption_oid {
 	},
 };
 
+/*
+ * Named-curve OIDs used in EC keys (PKCS#8 and X.509 SubjectPublicKeyInfo).
+ * Defined here so both l_cert_get_pubkey() and pkcs8_parse_ec_privkey()
+ * can use them.
+ */
+static const struct cert_ec_named_curve {
+	struct asn1_oid oid;
+	const char *name;
+} ec_named_curves[] = {
+	{ /* secp256r1 / prime256v1  1.2.840.10045.3.1.7 */
+		{ 8, { 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 } },
+		"secp256r1"
+	},
+	{ /* secp384r1  1.3.132.0.34 */
+		{ 5, { 0x2b, 0x81, 0x04, 0x00, 0x22 } },
+		"secp384r1"
+	},
+	{ /* secp521r1  1.3.132.0.35 */
+		{ 5, { 0x2b, 0x81, 0x04, 0x00, 0x23 } },
+		"secp521r1"
+	},
+};
+
+static const struct l_ecc_curve *cert_get_ec_curve_from_params_oid(
+						const uint8_t *oid,
+						size_t oid_len)
+{
+	unsigned int i;
+
+	for (i = 0; i < L_ARRAY_SIZE(ec_named_curves); i++) {
+		if (oid_len == ec_named_curves[i].oid.asn1_len &&
+				!memcmp(oid, ec_named_curves[i].oid.asn1,
+					oid_len))
+			return l_ecc_curve_from_name(ec_named_curves[i].name);
+	}
+
+	return NULL;
+}
+
 static bool cert_set_pubkey_type(struct l_cert *cert)
 {
 	const uint8_t *key_type;
@@ -444,12 +483,71 @@ LIB_EXPORT struct l_key *l_cert_get_pubkey(struct l_cert *cert)
 	if (unlikely(!cert))
 		return NULL;
 
-	/* Use kernel's ASN.1 certificate parser to find the key data for us */
 	switch (cert->pubkey_type) {
 	case L_CERT_KEY_RSA:
 		return l_key_new(L_KEY_RSA, cert->asn1, cert->asn1_len);
-	case L_CERT_KEY_ECC:
-		return l_key_new(L_KEY_ECC, cert->asn1, cert->asn1_len);
+	case L_CERT_KEY_ECC: {
+		/*
+		 * Extract the uncompressed EC point (04 || x || y) from the
+		 * SubjectPublicKeyInfo BIT STRING and create a software key so
+		 * that verification does not depend on the kernel supporting
+		 * every elliptic curve via ecdsa_generic.
+		 */
+		const uint8_t *spk;
+		size_t spk_len;
+		const uint8_t *alg_oid;
+		size_t alg_oid_len;
+		const struct l_ecc_curve *curve = NULL;
+		struct l_ecc_point *point;
+		struct l_key *key;
+
+		/* Named curve OID from AlgorithmIdentifier parameters */
+		alg_oid = asn1_der_find_elem_by_path(cert->asn1, cert->asn1_len,
+					ASN1_ID_OID, &alg_oid_len,
+					X509_CERTIFICATE_POS,
+					X509_TBSCERTIFICATE_POS,
+					X509_TBSCERT_SUBJECT_KEY_POS,
+					X509_SUBJECT_KEY_ALGORITHM_POS,
+					X509_ALGORITHM_ID_PARAMS_POS,
+					-1);
+		if (!alg_oid)
+			break;
+
+		curve = cert_get_ec_curve_from_params_oid(alg_oid, alg_oid_len);
+
+		if (!curve)
+			break;
+
+		/* SubjectPublicKey BIT STRING: skip the unused-bits byte */
+		spk = asn1_der_find_elem_by_path(cert->asn1, cert->asn1_len,
+					ASN1_ID_BIT_STRING, &spk_len,
+					X509_CERTIFICATE_POS,
+					X509_TBSCERTIFICATE_POS,
+					X509_TBSCERT_SUBJECT_KEY_POS,
+					X509_SUBJECT_KEY_VALUE_POS,
+					-1);
+		if (!spk || spk_len < 2)
+			break;
+
+		/* BIT STRING: first byte = unused bits count (should be 0),
+		 * then 04 (uncompressed point indicator), then x || y */
+		spk++;     /* skip unused-bits byte */
+		spk_len--;
+		if (*spk != 0x04)  /* only accept uncompressed points */
+			break;
+		spk++;     /* skip 04 prefix */
+		spk_len--;
+
+		point = l_ecc_point_from_data(curve,
+					L_ECC_POINT_TYPE_FULL,
+					spk, spk_len);
+		if (!point)
+			break;
+
+		key = key_new_ec_public(point);
+		l_ecc_point_free(point);
+		return key;
+	}
 	case L_CERT_KEY_UNKNOWN:
 		break;
 	}
@@ -861,28 +959,6 @@ LIB_EXPORT bool l_certchain_verify(struct l_certchain *chain,
 }
 
 /*
- * Named-curve OIDs used in PKCS#8 EC PrivateKeyInfo AlgorithmIdentifier
- * parameters and their corresponding ELL curve names.
- */
-static const struct {
-	struct asn1_oid oid;
-	const char *name;
-} ec_named_curves[] = {
-	{ /* secp256r1 / prime256v1  1.2.840.10045.3.1.7 */
-		{ 8, { 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 } },
-		"secp256r1"
-	},
-	{ /* secp384r1  1.3.132.0.34 */
-		{ 5, { 0x2b, 0x81, 0x04, 0x00, 0x22 } },
-		"secp384r1"
-	},
-	{ /* secp521r1  1.3.132.0.35 */
-		{ 5, { 0x2b, 0x81, 0x04, 0x00, 0x23 } },
-		"secp521r1"
-	},
-};
-
-/*
  * Try to parse an EC private key from a PKCS#8 PrivateKeyInfo.
  *
  * PrivateKeyInfo ::= SEQUENCE {
@@ -947,7 +1023,8 @@ static struct l_key *pkcs8_parse_ec_privkey(const uint8_t *der, size_t der_len)
 		if (param_oid_len == ec_named_curves[i].oid.asn1_len &&
 				!memcmp(param_oid, ec_named_curves[i].oid.asn1,
 					param_oid_len)) {
-			curve = l_ecc_curve_from_name(ec_named_curves[i].name);
+			curve = cert_get_ec_curve_from_params_oid(param_oid,
+								param_oid_len);
 			break;
 		}
 	}
