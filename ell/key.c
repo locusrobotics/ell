@@ -314,6 +314,14 @@ LIB_EXPORT struct l_key *l_key_new(enum l_key_type type, const void *payload,
 	return key;
 }
 
+LIB_EXPORT enum l_key_type l_key_get_type(struct l_key *key)
+{
+	if (unlikely(!key))
+		return L_KEY_RAW;
+
+	return key->type;
+}
+
 LIB_EXPORT void l_key_free(struct l_key *key)
 {
 	if (unlikely(!key))

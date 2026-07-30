@@ -47,6 +47,8 @@ enum l_key_cipher_type {
 struct l_key *l_key_new(enum l_key_type type, const void *payload,
 			size_t payload_length);
 
+enum l_key_type l_key_get_type(struct l_key *key);
+
 void l_key_free(struct l_key *key);
 void l_key_free_norevoke(struct l_key *key);
 
