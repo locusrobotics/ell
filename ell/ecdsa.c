@@ -160,8 +160,11 @@ bool ecdsa_verify(const struct l_ecc_point *pubkey,
 	const uint8_t *ptr = sig;
 	size_t len = sig_len;
 	uint16_t seq_len, r_len, s_len;
+	uint8_t z_buf[L_ECC_MAX_DIGITS * 8];
 	uint8_t r_buf[L_ECC_MAX_DIGITS * 8];
 	uint8_t s_buf[L_ECC_MAX_DIGITS * 8];
+	uint64_t x_mod_n[L_ECC_MAX_DIGITS];
+	unsigned int copy;
 
 	/* Parse DER SEQUENCE { INTEGER r, INTEGER s } */
 	if (len < 2 || *ptr++ != 0x30)
@@ -209,14 +212,12 @@ bool ecdsa_verify(const struct l_ecc_point *pubkey,
 		return false;
 
 	/* z = hash left-padded / right-truncated to nbytes, native VLI */
-	{
-		uint8_t z_buf[L_ECC_MAX_DIGITS * 8] = {};
-		unsigned int copy = (hash_len < nbytes) ? hash_len : nbytes;
-		memcpy(z_buf + nbytes - copy, hash + hash_len - copy, copy);
-		_ecc_be2native(z, (const uint64_t *)z_buf, ndigits);
-		if (_vli_cmp(z, curve->n, ndigits) >= 0)
-			_vli_sub(z, z, curve->n, ndigits);
-	}
+	memset(z_buf, 0, nbytes);
+	copy = (hash_len < nbytes) ? hash_len : nbytes;
+	memcpy(z_buf + nbytes - copy, hash + hash_len - copy, copy);
+	_ecc_be2native(z, (const uint64_t *)z_buf, ndigits);
+	if (_vli_cmp(z, curve->n, ndigits) >= 0)
+		_vli_sub(z, z, curve->n, ndigits);
 
 	/* w = s^(-1) mod n */
 	_vli_mod_inv(w, s, curve->n, ndigits);
@@ -237,11 +238,8 @@ bool ecdsa_verify(const struct l_ecc_point *pubkey,
 		return false;
 
 	/* Verify X.x mod n == r */
-	{
-		uint64_t x_mod_n[L_ECC_MAX_DIGITS];
-		memcpy(x_mod_n, X.x, nbytes);
-		if (_vli_cmp(x_mod_n, curve->n, ndigits) >= 0)
-			_vli_sub(x_mod_n, x_mod_n, curve->n, ndigits);
-		return _vli_cmp(x_mod_n, r, ndigits) == 0;
-	}
+	memcpy(x_mod_n, X.x, nbytes);
+	if (_vli_cmp(x_mod_n, curve->n, ndigits) >= 0)
+		_vli_sub(x_mod_n, x_mod_n, curve->n, ndigits);
+	return _vli_cmp(x_mod_n, r, ndigits) == 0;
 }
