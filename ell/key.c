@@ -784,14 +784,11 @@ LIB_EXPORT bool l_key_verify(struct l_key *key,
 		return key_ec_verify(key, sig, len_sig, data, len_data);
 	}
 
-	{
-		long result = kernel_key_verify(key->serial,
-						lookup_cipher(cipher),
-						lookup_checksum(checksum),
-						data, len_data,
-						sig, len_sig);
-		return result >= 0;
-	}
+	return kernel_key_verify(key->serial,
+					lookup_cipher(cipher),
+					lookup_checksum(checksum),
+					data, len_data,
+					sig, len_sig) >= 0;
 }
 
 LIB_EXPORT struct l_keyring *l_keyring_new(void)
