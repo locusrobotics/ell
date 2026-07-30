@@ -319,12 +319,17 @@ LIB_EXPORT void l_key_free(struct l_key *key)
 	if (unlikely(!key))
 		return;
 
-	/*
-	 * Use invalidate as, unlike revoke, this doesn't delay the
-	 * key garbage collection and causes the quota used by the
-	 * key to be released sooner and more predictably.
-	 */
-	kernel_invalidate_key(key->serial);
+	if (key->ec_privkey)
+		l_ecc_scalar_free(key->ec_privkey);
+	else if (key->ec_pubkey)
+		l_ecc_point_free(key->ec_pubkey);
+	else
+		/*
+		 * Use invalidate as, unlike revoke, this doesn't delay the
+		 * key garbage collection and causes the quota used by the
+		 * key to be released sooner and more predictably.
+		 */
+		kernel_invalidate_key(key->serial);
 
 	l_free(key);
 }
@@ -334,19 +339,12 @@ LIB_EXPORT void l_key_free_norevoke(struct l_key *key)
 	if (unlikely(!key))
 		return;
 
-	if (key->ec_privkey) {
+	if (key->ec_privkey)
 		l_ecc_scalar_free(key->ec_privkey);
-		l_free(key);
-		return;
-	}
-
-	if (key->ec_pubkey) {
+	else if (key->ec_pubkey)
 		l_ecc_point_free(key->ec_pubkey);
-		l_free(key);
-		return;
-	}
-
-	kernel_unlink_key(key->serial, internal_keyring);
+	else
+		kernel_unlink_key(key->serial, internal_keyring);
 
 	l_free(key);
 }
