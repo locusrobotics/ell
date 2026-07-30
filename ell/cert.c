@@ -1062,38 +1062,14 @@ static struct l_key *pkcs8_parse_ec_privkey(const uint8_t *der, size_t der_len)
 struct l_key *cert_key_from_pkcs8_private_key_info(const uint8_t *der,
 							size_t der_len)
 {
-	const uint8_t *seq, *alg_seq, *alg_oid;
-	uint8_t tag;
-	size_t seq_len, alg_seq_len, alg_oid_len;
+	struct l_key *key;
 
-	/* Read the AlgorithmIdentifier OID to dispatch without fallback */
-	seq = asn1_der_find_elem(der, der_len, 0, &tag, &seq_len);
-	if (!seq || tag != ASN1_ID_SEQUENCE)
-		return NULL;
+	/* Try EC first; pkcs8_parse_ec_privkey returns NULL for non-EC keys */
+	key = pkcs8_parse_ec_privkey(der, der_len);
+	if (key)
+		return key;
 
-	alg_seq = asn1_der_find_elem(seq, seq_len, 1, &tag, &alg_seq_len);
-	if (!alg_seq || tag != ASN1_ID_SEQUENCE)
-		return NULL;
-
-	alg_oid = asn1_der_find_elem(alg_seq, alg_seq_len, 0, &tag,
-					&alg_oid_len);
-	if (!alg_oid || tag != ASN1_ID_OID)
-		return NULL;
-
-	/* id-ecPublicKey (1.2.840.10045.2.1) → software EC private key */
-	if (alg_oid_len == pkcs1_encryption_oids[1].oid.asn1_len &&
-			!memcmp(alg_oid, pkcs1_encryption_oids[1].oid.asn1,
-				alg_oid_len))
-		return pkcs8_parse_ec_privkey(der, der_len);
-
-	/* rsaEncryption (1.2.840.113549.1.1.1) → kernel RSA key */
-	if (alg_oid_len == pkcs1_encryption_oids[0].oid.asn1_len &&
-			!memcmp(alg_oid, pkcs1_encryption_oids[0].oid.asn1,
-				alg_oid_len))
-		return l_key_new(L_KEY_RSA, der, der_len);
-
-	/* Unknown algorithm */
-	return NULL;
+	return l_key_new(L_KEY_RSA, der, der_len);
 }
 
 /*
